@@ -34,6 +34,7 @@
           (analysis-passes)
           (save-contract-info-passes)
           (typescript-passes)
+          (runtime-ir-passes)
           (circuit-passes)
           (zkir-passes)
           (zkir-v3-passes)
@@ -193,6 +194,10 @@
                             (run-passes manifest-passes circuit-ir
                               output-directory-pathname
                               output-subdirectories)))
+                        (with-target-ports
+                          '((runtime-ir.json . "compiler/runtime-ir.json"))
+                          (let ([ts-ir (prepare-for-typescript analyzed-ir)])
+                            (run-passes runtime-ir-passes ts-ir proof-circuit-name*)))
                         (when final-pass (internal-errorf 'generate-everything "never encountered final pass ~s" final-pass)))])))))))]))
 
   (define-pass extract-circuit-names : Lflattened (ir) -> * (ls)
