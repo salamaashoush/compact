@@ -46,6 +46,15 @@
 
   (define schema-version 1)
 
+  ;; A ref-expression carrier: when expand-vm-code substitutes an arg
+  ;; (e.g. circuit-call argument or runtime-computed path element), we
+  ;; pass through a `vmref-expr` record carrying the type + the IR-JSON
+  ;; rendering of the underlying expression.  vmop->json recognises
+  ;; this and emits a JSON node `{"vm": "ref", "type": ..., "value": <expr>}`.
+  (define-record-type vmref-expr
+    (nongenerative)
+    (fields type expr-json))
+
   ;; Render an integer or big-integer as a JSON-safe representation.
   ;; Standard JSON `number` caps at 2^53; we use strings for anything
   ;; that exceeds the safe-integer range, matching the convention used
@@ -221,6 +230,10 @@
   ;; as a JSON datum.  Keys mirror the VMop datatype constructors.
   (define (vmop->json v)
     (cond
+      [(vmref-expr? v)
+       (list (cons "vm" "ref")
+             (cons "type" (type->json (vmref-expr-type v)))
+             (cons "value" (vmref-expr-expr-json v)))]
       [(VMop? v) (vmop-record->json v)]
       [(list? v)
        (list->vector (map vmop->json v))]
@@ -653,24 +666,23 @@
                          (nanopass-case (Ltypescript Path-Element) path-elt
                            [,path-index (VMalign path-index 1)]
                            [(,src ,type ,expr)
-                            ;; For path elements that are
-                            ;; runtime-computed (not literal indices),
-                            ;; the JS emitter inlines the typed-value
-                            ;; expression.  In the IR we represent
-                            ;; this as a placeholder VMop carrying the
-                            ;; expression — consumers must evaluate
-                            ;; the expr to get the path value.
-                            (VMalign 0 1)]))
+                            ;; Runtime-computed path elements carry
+                            ;; their type + IR expression so consumers
+                            ;; can evaluate the expression to recover
+                            ;; the path value.
+                            (make-vmref-expr type (expression->json expr))]))
                        path-elt*)
                   #f
                   (append (map cons adt-formal* adt-arg*)
                           (map (lambda (vn t e)
-                                 ;; Bind the call-site argument to a
-                                 ;; placeholder VMop (VMalign 0 1) so
-                                 ;; expand-vm-code finds the binding;
-                                 ;; the IR emits the actual expression
-                                 ;; in `arguments` separately.
-                                 (cons (id-sym vn) (VMalign 0 1)))
+                                 ;; Bind each call-site argument to a
+                                 ;; vmref-expr carrying the IR
+                                 ;; expression.  The vm-op's argument
+                                 ;; slots will then carry the actual
+                                 ;; expression IR rather than a
+                                 ;; placeholder.
+                                 (cons (id-sym vn)
+                                       (make-vmref-expr t (expression->json e))))
                                var-name* type* expr*))
                   (vm-code-code vm-code))])
          (list (cons "expr" "adt-op")
@@ -731,6 +743,12 @@
                             acc))]))]))
 
       ;; Build the JSON-renderable body for one circuit definition.
+      ;; If the circuit is exported with one or more external names,
+      ;; emits one record per external name.  Otherwise emits a single
+      ;; record under the internal name (helper / non-exported circuits
+      ;; need to be available to consumers because exported circuits
+      ;; transitively call them — e.g. `mintShieldedToken` is a stdlib
+      ;; helper imported by user contracts).
       (define (Circuit-Body cdefn export-alist proof-circuit-name*)
         (nanopass-case (Ltypescript Circuit-Definition) cdefn
           [(circuit ,src ,function-name (,arg* ...) ,type ,stmt)
@@ -742,18 +760,21 @@
                             (cons (symbol->string (car a)) names)
                             names))
                       '() export-alist)])
-               (map (lambda (external-name)
-                      (list
-                        (cons "name" external-name)
-                        (cons "internal-name" (sym->json sym))
-                        (cons "exported" (id-exported? function-name))
-                        (cons "pure" (id-pure? function-name))
-                        (cons "proof" (and (memq sym proof-circuit-name*) #t))
-                        (cons "arguments"
-                              (list->vector (map Argument arg*)))
-                        (cons "result-type" (type->json type))
-                        (cons "body" (statement->json stmt))))
-                    external-names)))]))
+               (let ([names (if (null? external-names)
+                                (list (symbol->string sym))
+                                external-names)])
+                 (map (lambda (n)
+                        (list
+                          (cons "name" n)
+                          (cons "internal-name" (sym->json sym))
+                          (cons "exported" (id-exported? function-name))
+                          (cons "pure" (id-pure? function-name))
+                          (cons "proof" (and (memq sym proof-circuit-name*) #t))
+                          (cons "arguments"
+                                (list->vector (map Argument arg*)))
+                          (cons "result-type" (type->json type))
+                          (cons "body" (statement->json stmt))))
+                      names))))]))
 
       ;; Render a witness declaration.
       (define (Witness wdecl)
@@ -871,7 +892,6 @@
                          (lambda (p acc)
                            (nanopass-case (Ltypescript Program-Element) p
                              [(circuit ,src ,function-name (,arg* ...) ,type ,stmt)
-                              (guard (id-exported? function-name))
                               (append (Circuit-Body p export-alist proof-circuit-name*) acc)]
                              [else acc]))
                          '() pelt*)))
