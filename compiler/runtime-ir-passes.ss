@@ -214,6 +214,24 @@
   ;; Render a vm-instruction (a `vminstr` record from `expand-vm-code`)
   ;; as one JSON object.  The instruction has an `op` symbol and a list
   ;; of (arg-name . VMop-or-list-of-VMop) pairs.
+  ;; A vm-op argument value contains VMsuppress if the recipe's
+  ;; substitution evaluated to one of the `(suppress-null ...)` /
+  ;; `(suppress-zero ...)` sentinels.  The JS emitter drops the entire
+  ;; instruction in that case (per `(guard ((suppressed-condition? c)
+  ;; q*) ...)` in typescript-passes); the IR matches that behaviour.
+  (define (value-has-suppress? v)
+    (cond
+      [(VMop? v)
+       (VMop-case v
+         [(VMsuppress) #t]
+         [else #f])]
+      [(list? v) (ormap value-has-suppress? v)]
+      [else #f]))
+
+  (define (vminstr-has-suppress? instr)
+    (ormap (lambda (arg) (value-has-suppress? (cdr arg)))
+           (vminstr-arg* instr)))
+
   (define (vminstr->json instr)
     (let ([op-name (vminstr-op instr)]
           [args (vminstr-arg* instr)])
@@ -225,6 +243,12 @@
                      (cons (if (symbol? k) (symbol->string k) k)
                            (vmop->json (cdr arg)))))
                  args))))
+
+  (define (vminstrs->json-vector vminstr*)
+    (list->vector
+     (map vminstr->json
+          (filter (lambda (i) (not (vminstr-has-suppress? i)))
+                  vminstr*))))
 
   ;; Render a single VMop record (or a list of them, for path values)
   ;; as a JSON datum.  Keys mirror the VMop datatype constructors.
@@ -699,7 +723,7 @@
                      (list->vector (map expression->json expr*)))
                (cons "result-type" (type->json type))
                (cons "vm-ops"
-                     (list->vector (map vminstr->json vminstr*)))))]))
+                     (vminstrs->json-vector vminstr*))))]))
 
   ;; ------------------------------------------------------------------
   ;; Top-level pass.
@@ -856,7 +880,96 @@
         (nanopass-case (Ltypescript Ledger-Constructor) lconstructor
           [(constructor ,src (,arg* ...) ,stmt)
            (list (cons "arguments" (list->vector (map Argument arg*)))
-                 (cons "body" (statement->json stmt)))])))
+                 (cons "body" (statement->json stmt)))]))
+
+      ;; Build the initial-state skeleton.  Walks pl-array recursively:
+      ;; each pl-array becomes a state-value array; each public-binding
+      ;; becomes a Null leaf.
+      (define (build-init-skeleton pl-array)
+        (nanopass-case (Ltypescript Public-Ledger-Array) pl-array
+          [(public-ledger-array ,pl-array-elt* ...)
+           (list (cons "kind" "array")
+                 (cons "items"
+                       (list->vector
+                        (map build-init-skeleton-elt pl-array-elt*))))]))
+      (define (build-init-skeleton-elt elt)
+        (nanopass-case (Ltypescript Public-Ledger-Array-Element) elt
+          [,pl-array (build-init-skeleton pl-array)]
+          [,public-binding '(("kind" . "null"))]))
+
+      ;; Find an ADT's `resetToDefault` op record by name.  Used to
+      ;; expand the init VM ops for each ledger field.
+      (define (find-adt-op-by-name name adt-op*)
+        (let loop ([rest adt-op*])
+          (cond
+            [(null? rest) #f]
+            [else
+             (let ([op (car rest)])
+               (nanopass-case (Ltypescript ADT-Op) op
+                 [(,ledger-op ,op-class (,adt-name (,adt-formal* ,adt-arg*) ...) ((,var-name* ,type*) ...) ,type ,vm-code)
+                  (if (eq? ledger-op name)
+                      op
+                      (loop (cdr rest)))]))])))
+
+      ;; Build the init VM ops for one public-binding by expanding its
+      ;; ADT's `resetToDefault` recipe.  The path is the binding's
+      ;; path-index list (each path-index becomes a VMalign 1-byte value).
+      (define (build-init-ops-for-binding pb)
+        (nanopass-case (Ltypescript Public-Ledger-Binding) pb
+          [(,src ,ledger-field-name (,path-index* ...) ,type)
+           (let ([unwrapped (unwrap-to-adt type)])
+             (nanopass-case (Ltypescript Type) unwrapped
+               [(tadt ,src ,adt-name ([,adt-formal* ,adt-arg*] ...) ,vm-expr (,adt-op* ...) (,adt-rt-op* ...))
+                ;; Skip Kernel — it's not a user field.
+                (cond
+                  [(kernel-adt? adt-name) '()]
+                  [else
+                   (let ([reset-op (find-adt-op-by-name 'resetToDefault adt-op*)])
+                     (cond
+                       [(not reset-op) '()]
+                       [else
+                        (nanopass-case (Ltypescript ADT-Op) reset-op
+                          [(,ledger-op ,op-class (,adt-name (,adt-formal* ,adt-arg*) ...) ((,var-name* ,type*) ...) ,type ,vm-code)
+                           (let* ([op-class-sym (cond
+                                                  [(symbol? op-class) op-class]
+                                                  [(pair? op-class) (car op-class)]
+                                                  [else op-class])]
+                                  [vminstr*
+                                    (expand-vm-code
+                                     #f
+                                     (map (lambda (pi) (VMalign pi 1)) path-index*)
+                                     #f
+                                     (map cons adt-formal* adt-arg*)
+                                     (vm-code-code vm-code))])
+                             (list
+                              (list
+                               (cons "expr" "adt-op")
+                               (cons "adt" (sym->json (clean-adt-name adt-name)))
+                               (cons "operation" (sym->json ledger-op))
+                               (cons "op-class" (sym->json op-class-sym))
+                               (cons "field" (sym->json (id-sym ledger-field-name)))
+                               (cons "field-path"
+                                     (list->vector
+                                      (map (lambda (pi)
+                                             (list (cons "kind" "literal")
+                                                   (cons "index" pi)))
+                                           path-index*)))
+                               (cons "arguments" (vector))
+                               (cons "result-type" (type->json type))
+                               (cons "vm-ops"
+                                     (vminstrs->json-vector vminstr*)))))])]))])]
+               [else '()]))]))
+
+      ;; Walk the entire pl-array tree and concatenate init ops.
+      (define (build-init-ops pl-array)
+        (nanopass-case (Ltypescript Public-Ledger-Array) pl-array
+          [(public-ledger-array ,pl-array-elt* ...)
+           (apply append
+             (map (lambda (elt)
+                    (nanopass-case (Ltypescript Public-Ledger-Array-Element) elt
+                      [,pl-array (build-init-ops pl-array)]
+                      [,public-binding (build-init-ops-for-binding public-binding)]))
+                  pl-array-elt*))])))
 
     (Program : Program (ir) -> Program ()
       [(program ,src ((,export-name* ,name*) ...) ,tdescs ,pelt* ...)
@@ -897,20 +1010,38 @@
                          '() pelt*)))
                ;; Type descriptor table.
                (cons "descriptors" (descriptors->json tdescs))
-               ;; Constructor body — we look for the
-               ;; (public-ledger-declaration pl-array lconstructor)
-               ;; pelt and pull its lconstructor.
+               ;; Constructor body — combines the auto-generated
+               ;; initialization (skeleton state-value tree, init vm-ops
+               ;; from each ledger field's resetToDefault recipe,
+               ;; setOperation registrations for provable circuits) with
+               ;; the user-written `constructor() {...}` stmt body.
                (cons "constructor"
                      (let loop ([rem pelt*])
                        (cond
                          [(null? rem)
                           (list (cons "arguments" (vector))
+                                (cons "initial-state"
+                                      '(("kind" . "array") ("items" . #())))
+                                (cons "init-ops" (vector))
+                                (cons "register-operations"
+                                      (list->vector
+                                       (map symbol->string proof-circuit-name*)))
                                 (cons "body" (list (cons "stmt" "noop"))))]
                          [else
                           (let ([p (car rem)])
                             (nanopass-case (Ltypescript Program-Element) p
                               [(public-ledger-declaration ,pl-array ,lconstructor)
-                               (Ledger-Constructor lconstructor)]
+                               (let ([base (Ledger-Constructor lconstructor)])
+                                 (append
+                                  (list (car base))   ; arguments
+                                  (list (cons "initial-state"
+                                              (build-init-skeleton pl-array)))
+                                  (list (cons "init-ops"
+                                              (list->vector (build-init-ops pl-array))))
+                                  (list (cons "register-operations"
+                                              (list->vector
+                                               (map symbol->string proof-circuit-name*))))
+                                  (cdr base)))]   ; body
                               [else (loop (cdr rem))]))])))
                ;; External-contract declarations.  Currently empty —
                ;; the cross-contract surface in Ltypescript needs the
