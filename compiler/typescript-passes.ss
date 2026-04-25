@@ -16,7 +16,7 @@
 ;;; limitations under the License.
 
 (library (typescript-passes)
-  (export typescript-passes)
+  (export typescript-passes prepare-for-typescript)
   (import (except (chezscheme) errorf)
           (utils)
           (datatype)
