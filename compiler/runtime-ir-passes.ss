@@ -491,8 +491,13 @@
              (cons "name" (sym->json (id-sym var-name)))
              (cons "value" (expression->json expr)))]
       [(call ,src ,function-name ,expr* ...)
+       ;; Emit `function-uniq` (id-uniq) so consumers can disambiguate
+       ;; between monomorphized instantiations of the same source-level
+       ;; generic function (e.g. `none<Opaque<string>>` vs
+       ;; `none<ShieldedCoinInfo>`) which both have `name: "none"`.
        (list (cons "expr" "call")
              (cons "function" (sym->json (id-sym function-name)))
+             (cons "function-uniq" (number->json (id-uniq function-name)))
              (cons "arguments"
                    (list->vector (map expression->json expr*))))]
       [(new ,src ,type ,expr* ...)
@@ -676,14 +681,23 @@
 
   ;; Render an ADT-Op invocation.  The IR carries the symbolic name +
   ;; the pre-expanded VM op sequence.
+  ;; Destructure an `ADT-Op-Class` nanopass record into its parts.
+  ;; The class has two productions (langs.ss:428):
+  ;;   (+ ledger-op-class                    ; bare symbol
+  ;;      (ledger-op-class nat nat^))        ; symbol + coin-idx + recipient-idx
+  ;; Returns three values: the symbol, the coin index (or #f), and
+  ;; the recipient index (or #f).
+  (define (op-class->parts op-class)
+    (nanopass-case (Ltypescript ADT-Op-Class) op-class
+      [,ledger-op-class (values ledger-op-class #f #f)]
+      [(,ledger-op-class ,nat ,nat^) (values ledger-op-class nat nat^)]))
+
   (define (adt-op-invocation->json ledger-field-name path-elt* adt-op expr*)
     (nanopass-case (Ltypescript ADT-Op) adt-op
       [(,ledger-op ,op-class (,adt-name (,adt-formal* ,adt-arg*) ...) ((,var-name* ,type*) ...) ,type ,vm-code)
-       (let* ([op-class-sym (cond
-                              [(symbol? op-class) op-class]
-                              [(pair? op-class) (car op-class)]
-                              [else op-class])]
-              [vminstr*
+       (let*-values ([(op-class-sym op-class-coin-idx op-class-recipient-idx)
+                      (op-class->parts op-class)])
+         (let* ([vminstr*
                 (expand-vm-code
                   #f
                   (map (lambda (path-elt)
@@ -713,6 +727,19 @@
                (cons "adt" (sym->json (clean-adt-name adt-name)))
                (cons "operation" (sym->json ledger-op))
                (cons "op-class" (sym->json op-class-sym))
+               ;; When the op-class is the parameterised variant
+               ;; `(ledger-op-class nat nat^)`, emit the coin and
+               ;; recipient indices so consumers know which positional
+               ;; argument is the coin / recipient (used today by
+               ;; `update-with-coin-check` for kernel coin operations).
+               (cons "op-class-coin-index"
+                     (if op-class-coin-idx
+                         (number->json op-class-coin-idx)
+                         (void)))
+               (cons "op-class-recipient-index"
+                     (if op-class-recipient-idx
+                         (number->json op-class-recipient-idx)
+                         (void)))
                (cons "field"
                      (if ledger-field-name
                          (sym->json (id-sym ledger-field-name))
@@ -723,7 +750,7 @@
                      (list->vector (map expression->json expr*)))
                (cons "result-type" (type->json type))
                (cons "vm-ops"
-                     (vminstrs->json-vector vminstr*))))]))
+                     (vminstrs->json-vector vminstr*)))))]))
 
   ;; ------------------------------------------------------------------
   ;; Top-level pass.
@@ -791,6 +818,15 @@
                         (list
                           (cons "name" n)
                           (cons "internal-name" (sym->json sym))
+                          ;; `internal-uniq` (id-uniq) disambiguates
+                          ;; monomorphized instantiations of generic
+                          ;; circuits that share a source-level name
+                          ;; (e.g. `none<Opaque<string>>` and
+                          ;; `none<ShieldedCoinInfo>` both emit
+                          ;; `name: "none"`). Consumers match against
+                          ;; the corresponding `function-uniq` on Call
+                          ;; sites to pick the right instantiation.
+                          (cons "internal-uniq" (number->json (id-uniq function-name)))
                           (cons "exported" (id-exported? function-name))
                           (cons "pure" (id-pure? function-name))
                           (cons "proof" (and (memq sym proof-circuit-name*) #t))
