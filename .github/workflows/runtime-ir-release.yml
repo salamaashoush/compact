@@ -1,7 +1,8 @@
 name: Runtime-IR fork release
 
-# Builds compactc-binary (the runtime-ir-emitting fork) via nix and
-# uploads the result to a GitHub release.  Triggered manually:
+# Builds compactc-binary (the runtime-ir-emitting fork) via nix on
+# every Tier 1 target and uploads the result to a single GitHub
+# release.  Triggered manually:
 #   gh workflow run runtime-ir-release.yml -f tag=compactc-v0.31.101-runtime-ir.1
 
 on:
@@ -22,10 +23,24 @@ permissions:
 
 jobs:
   build:
-    name: Build compactc-binary on linux x86_64
-    runs-on: ubuntu-latest
-    outputs:
-      tarball: ${{ steps.package.outputs.tarball }}
+    name: Build compactc-binary on ${{ matrix.target_triple }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_triple: x86_64-unknown-linux-musl
+            asset: compactc-payload-x86_64-linux.tar.gz
+            runner: ubuntu-latest
+          - target_triple: aarch64-unknown-linux-musl
+            asset: compactc-payload-aarch64-linux.tar.gz
+            runner: ubuntu-24.04-arm
+          - target_triple: x86_64-apple-darwin
+            asset: compactc-payload-x86_64-macos.tar.gz
+            runner: macos-13
+          - target_triple: aarch64-apple-darwin
+            asset: compactc-payload-aarch64-macos.tar.gz
+            runner: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,25 +66,26 @@ jobs:
           file result/bin/* result/lib/* || true
 
       - name: Package as tarball
-        id: package
+        env:
+          TRIPLE: ${{ matrix.target_triple }}
+          ASSET: ${{ matrix.asset }}
         run: |
-          mkdir -p payload/x86_64-unknown-linux-musl
-          cp result/bin/compactc      payload/x86_64-unknown-linux-musl/compactc
-          cp result/bin/compactc.bin  payload/x86_64-unknown-linux-musl/compactc.bin
-          cp result/bin/format-compact payload/x86_64-unknown-linux-musl/format-compact 2>/dev/null || true
-          cp result/bin/fixup-compact  payload/x86_64-unknown-linux-musl/fixup-compact 2>/dev/null || true
-          cp result/lib/zkir          payload/x86_64-unknown-linux-musl/zkir
-          cp result/lib/zkir-v3       payload/x86_64-unknown-linux-musl/zkir-v3
-          chmod +x payload/x86_64-unknown-linux-musl/*
-          tar -czf compactc-payload-x86_64-linux.tar.gz -C payload x86_64-unknown-linux-musl
-          ls -lh compactc-payload-x86_64-linux.tar.gz
-          echo "tarball=compactc-payload-x86_64-linux.tar.gz" >> $GITHUB_OUTPUT
+          mkdir -p "payload/$TRIPLE"
+          cp result/bin/compactc       "payload/$TRIPLE/compactc"
+          cp result/bin/compactc.bin   "payload/$TRIPLE/compactc.bin"
+          cp result/bin/format-compact "payload/$TRIPLE/format-compact" 2>/dev/null || true
+          cp result/bin/fixup-compact  "payload/$TRIPLE/fixup-compact" 2>/dev/null || true
+          cp result/lib/zkir           "payload/$TRIPLE/zkir"
+          cp result/lib/zkir-v3        "payload/$TRIPLE/zkir-v3"
+          chmod +x "payload/$TRIPLE/"*
+          tar -czf "$ASSET" -C payload "$TRIPLE"
+          ls -lh "$ASSET"
 
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: compactc-payload-x86_64-linux
-          path: compactc-payload-x86_64-linux.tar.gz
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
           if-no-files-found: error
 
   release:
@@ -83,10 +99,15 @@ jobs:
           ref: ${{ inputs.branch }}
           fetch-depth: 0
 
-      - name: Download artifact
+      - name: Download every build artifact
         uses: actions/download-artifact@v4
         with:
-          name: compactc-payload-x86_64-linux
+          path: artifacts/
+
+      - name: Flatten artifact directories
+        run: |
+          find artifacts/ -type f -name "*.tar.gz" -print -exec mv {} . \;
+          ls -lh *.tar.gz
 
       - name: Create + push tag
         env:
@@ -98,20 +119,23 @@ jobs:
             echo "tag $TAG already exists locally"
           else
             git tag "$TAG"
-            git push origin "$TAG"
+            git push origin "$TAG" || echo "tag may already exist on remote — continuing"
           fi
 
-      - name: Create release + upload asset
+      - name: Create release + upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
         run: |
+          ASSETS=$(ls *.tar.gz)
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" compactc-payload-x86_64-linux.tar.gz \
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $ASSETS \
               -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" compactc-payload-x86_64-linux.tar.gz \
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $ASSETS \
               -R "$GITHUB_REPOSITORY" \
               --title "$TAG" \
-              --notes "Compactc fork build (runtime-ir-emitting). Linux x86_64."
+              --notes "Compactc fork build (runtime-ir-emitting). Linux + macOS, x86_64 + aarch64."
           fi
