@@ -35,9 +35,6 @@ jobs:
           - target_triple: aarch64-unknown-linux-musl
             asset: compactc-payload-aarch64-linux.tar.gz
             runner: ubuntu-24.04-arm
-          - target_triple: x86_64-apple-darwin
-            asset: compactc-payload-x86_64-macos.tar.gz
-            runner: macos-13
           - target_triple: aarch64-apple-darwin
             asset: compactc-payload-aarch64-macos.tar.gz
             runner: macos-14
