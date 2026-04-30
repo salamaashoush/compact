@@ -1,0 +1,117 @@
+name: Runtime-IR fork release
+
+# Builds compactc-binary (the runtime-ir-emitting fork) via nix and
+# uploads the result to a GitHub release.  Triggered manually:
+#   gh workflow run runtime-ir-release.yml -f tag=compactc-v0.31.101-runtime-ir.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. compactc-v0.31.101-runtime-ir.1)"
+        required: true
+        type: string
+      branch:
+        description: "Branch to build from"
+        required: true
+        type: string
+        default: feat/json-ir-emitter
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build compactc-binary on linux x86_64
+    runs-on: ubuntu-latest
+    outputs:
+      tarball: ${{ steps.package.outputs.tarball }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ=
+            extra-substituters = https://cache.iog.io
+            accept-flake-config = true
+
+      - name: nix build compactc-binary
+        run: |
+          nix build .#compactc-binary -L
+
+      - name: Inspect result
+        run: |
+          ls -lR result/
+          file result/bin/* result/lib/* || true
+
+      - name: Package as tarball
+        id: package
+        run: |
+          mkdir -p payload/x86_64-unknown-linux-musl
+          cp result/bin/compactc      payload/x86_64-unknown-linux-musl/compactc
+          cp result/bin/compactc.bin  payload/x86_64-unknown-linux-musl/compactc.bin
+          cp result/bin/format-compact payload/x86_64-unknown-linux-musl/format-compact 2>/dev/null || true
+          cp result/bin/fixup-compact  payload/x86_64-unknown-linux-musl/fixup-compact 2>/dev/null || true
+          cp result/lib/zkir          payload/x86_64-unknown-linux-musl/zkir
+          cp result/lib/zkir-v3       payload/x86_64-unknown-linux-musl/zkir-v3
+          chmod +x payload/x86_64-unknown-linux-musl/*
+          tar -czf compactc-payload-x86_64-linux.tar.gz -C payload x86_64-unknown-linux-musl
+          ls -lh compactc-payload-x86_64-linux.tar.gz
+          echo "tarball=compactc-payload-x86_64-linux.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compactc-payload-x86_64-linux
+          path: compactc-payload-x86_64-linux.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create / update GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout (for tag push)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: compactc-payload-x86_64-linux
+
+      - name: Create + push tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists locally"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Create release + upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" compactc-payload-x86_64-linux.tar.gz \
+              -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" compactc-payload-x86_64-linux.tar.gz \
+              -R "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "Compactc fork build (runtime-ir-emitting). Linux x86_64."
+          fi
