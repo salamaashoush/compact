@@ -15,12 +15,20 @@
 ;;; See the License for the specific language governing permissions and
 ;;; limitations under the License.
 
-;;; runtime-ir-passes.ss --- emit a language-agnostic JSON IR
+;;; runtime-ir-passes.ss --- emit a language-agnostic CBOR IR
 ;;;
 ;;; This pass walks the post-typescript-prep IR (`Ltypescript`) and emits a
-;;; structured JSON file at `compiler/runtime-ir.json` describing every
+;;; structured CBOR file at `compiler/runtime-ir.cbor` describing every
 ;;; runtime-affecting construct of the contract.  See `doc/runtime-ir.md`
 ;;; for the schema specification.
+;;;
+;;; The wire format is RFC 8949 CBOR.  The Scheme datum shape consumed by
+;;; (cbor)::print-cbor is identical to what print-json used to take —
+;;; alists for maps, vectors for arrays, strings/symbols for text, exact
+;;; integers for numbers, #t/#f for booleans, (void) for null.  Integers
+;;; that don't fit a CBOR uint/nint (>2^64-1, <-2^64) fall back to a
+;;; decimal text-string, matching the existing IntLit::visit_str path on
+;;; the consumer.
 ;;;
 ;;; The pass runs after `prepare-for-typescript` (which produces
 ;;; `Ltypescript`) so we get the same lowered IR the JS emitter consumes.
@@ -35,7 +43,7 @@
           (utils)
           (datatype)
           (nanopass)
-          (json)
+          (cbor)
           (langs)
           (vm)
           (compiler-version)
@@ -55,16 +63,12 @@
     (nongenerative)
     (fields type expr-json))
 
-  ;; Render an integer or big-integer as a JSON-safe representation.
-  ;; Standard JSON `number` caps at 2^53; we use strings for anything
-  ;; that exceeds the safe-integer range, matching the convention used
-  ;; by `contract-info.json`'s `maxval`.
-  (define safe-integer-max (expt 2 53))
-  (define (number->json n)
-    (cond
-      [(not (integer? n)) n]
-      [(and (>= n (- safe-integer-max)) (< n safe-integer-max)) n]
-      [else (number->string n)]))
+  ;; Pass-through helper kept for source compatibility with the call
+  ;; sites that previously ran integers through JSON-safe coercion.
+  ;; CBOR's uint/nint majors cover the full [-2^64, 2^64-1] range
+  ;; natively; the encoder in (cbor) handles the >u64 / <-2^64 fallback
+  ;; to a decimal text string itself, so this is an identity function.
+  (define (number->json n) n)
 
   ;; Convert a Scheme symbol to a JSON string.  All symbols in the IR
   ;; render as strings.
@@ -1009,9 +1013,9 @@
 
     (Program : Program (ir) -> Program ()
       [(program ,src ((,export-name* ,name*) ...) ,tdescs ,pelt* ...)
-       (let ([op (get-target-port 'runtime-ir.json)])
+       (let ([op (get-target-port 'runtime-ir.cbor)])
          (let ([export-alist (map cons export-name* name*)])
-           (print-json op
+           (print-cbor op
              (list
                (cons "schema-version" schema-version)
                (cons "compiler-version" compiler-version-string)

@@ -98,11 +98,15 @@
                             (begin
                               (create-hierarchy (path-parent path))
                               (let ([op (guard (c [else (error-accessing-file c "creating output file")])
-                                          (if (equal? (path-extension path) "js")
-                                              (begin
-                                                (register-target-pathname! path)
-                                                (open-output-file/line&col-positions path 'replace))
-                                              (open-output-file path 'replace)))])
+                                          (cond
+                                            [(equal? (path-extension path) "js")
+                                             (register-target-pathname! path)
+                                             (open-output-file/line&col-positions path 'replace)]
+                                            [(equal? (path-extension path) "cbor")
+                                             (open-file-output-port path
+                                                                    (file-options no-fail))]
+                                            [else
+                                             (open-output-file path 'replace)]))])
                                 (set! created-file* (cons path created-file*))
                                 op)))))
                    (let ([maybe-op* (map open-target-port (map cdr alist))])
@@ -175,7 +179,7 @@
                            (parameterize ([proof-circuit-names proof-circuit-name*])
                              (run-passes typescript-passes analyzed-ir)))
                           (with-target-ports
-                            '((runtime-ir.json . "compiler/runtime-ir.json"))
+                            '((runtime-ir.cbor . "compiler/runtime-ir.cbor"))
                             (let ([ts-ir (prepare-for-typescript analyzed-ir)])
                               (run-passes runtime-ir-passes ts-ir proof-circuit-name*)))
                           (when final-pass (internal-errorf 'generate-everything "never encountered final pass ~s" final-pass)))]))))))))]))
