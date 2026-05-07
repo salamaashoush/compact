@@ -660,28 +660,19 @@
          (unparse-Ltypescript path-elt))]))
 
   ;; Render a literal datum (the `,datum` of `(quote ,datum)`).
+  ;; Bytevectors flow through unchanged — the CBOR encoder
+  ;; (cbor.ss::encode-bstr) emits them as native CBOR byte strings
+  ;; (major type 2). Consumers deserialize directly into byte-honest
+  ;; `RuntimeValue::Bytes`, eliminating the previous hex-string round
+  ;; trip on every byte literal.
   (define (datum->json d)
     (cond
       [(boolean? d) d]
       [(integer? d) (number->json d)]
-      [(bytevector? d)
-       (let ([n (bytevector-length d)])
-         (let loop ([i 0] [chars '()])
-           (if (= i n)
-               (list->string (reverse chars))
-               (let* ([b (bytevector-u8-ref d i)]
-                      [hi (quotient b 16)]
-                      [lo (remainder b 16)])
-                 (loop (+ i 1)
-                       (cons* (hex-digit lo) (hex-digit hi) chars))))))]
+      [(bytevector? d) d]
       [else
        (internal-errorf 'runtime-ir
          "unhandled literal datum: ~s" d)]))
-
-  (define (hex-digit n)
-    (if (< n 10)
-        (integer->char (+ (char->integer #\0) n))
-        (integer->char (+ (char->integer #\a) (- n 10)))))
 
   ;; Render an ADT-Op invocation.  The IR carries the symbolic name +
   ;; the pre-expanded VM op sequence.

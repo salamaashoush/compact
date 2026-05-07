@@ -18,6 +18,7 @@
 ;;; Concentric Scheme datum convention (mirrors json.ss):
 ;;;   alist of (key . value) pairs   -> CBOR map (major type 5)
 ;;;   vector                         -> CBOR array (major type 4)
+;;;   bytevector                     -> CBOR byte string (major type 2)
 ;;;   string                         -> CBOR text string (major type 3)
 ;;;   symbol                         -> CBOR text string (symbol->string)
 ;;;   exact integer in [-2^64, 2^64) -> CBOR uint or nint (major 0/1)
@@ -39,6 +40,7 @@
   ;; Major types (upper 3 bits of the initial byte).
   (define MT-UINT   0)
   (define MT-NINT   1)
+  (define MT-BSTR   2)
   (define MT-TSTR   3)
   (define MT-ARRAY  4)
   (define MT-MAP    5)
@@ -99,6 +101,11 @@
       (put-head op MT-TSTR len)
       (put-bytevector op bv)))
 
+  (define (encode-bstr op bv)
+    (let ([len (bytevector-length bv)])
+      (put-head op MT-BSTR len)
+      (put-bytevector op bv)))
+
   (define (encode-int op n)
     (cond
       [(>= n 0)
@@ -143,6 +150,7 @@
       [(boolean? v)                       (encode-bool op v)]
       [(symbol? v)                        (encode-tstr op (symbol->string v))]
       [(string? v)                        (encode-tstr op v)]
+      [(bytevector? v)                    (encode-bstr op v)]
       [(and (integer? v) (exact? v))      (encode-int op v)]
       [(vector? v)                        (encode-array op v)]
       ;; Match json.ss convention: non-empty list of pairs OR empty list
