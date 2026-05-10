@@ -75,6 +75,21 @@
   (define (sym->json s)
     (if (symbol? s) (symbol->string s) s))
 
+  ;; Convert an id to a JSON string suitable for use as a binding /
+  ;; reference name.  Compiler-generated temps (`make-temp-id`) share a
+  ;; symbol — typically `tmp` — but carry distinct `id-uniq` counters,
+  ;; so two sequential `(const tmp ...)` shadowing forms must serialize
+  ;; to different strings or downstream consumers (which key into a
+  ;; flat scope) collapse them.  Source-level ids keep their plain
+  ;; symbol so user-visible names — circuit arguments, witness
+  ;; arguments — render unchanged.
+  (define (var-id->json id)
+    (if (and (id? id) (id-temp? id))
+        (string-append (symbol->string (id-sym id))
+                       "@"
+                       (number->string (id-uniq id)))
+        (sym->json (id-sym id))))
+
   ;; ------------------------------------------------------------------
   ;; Type rendering — mirrors save-contract-info-passes.ss::Type so the
   ;; runtime-ir.json's type shapes match contract-info.json bit-for-bit.
@@ -352,7 +367,7 @@
   (define (local->json local)
     (nanopass-case (Ltypescript Argument) local
       [(,var-name ,type)
-       (list (cons "name" (sym->json (id-sym var-name)))
+       (list (cons "name" (var-id->json var-name))
              (cons "type" (type->json type)))]))
 
   ;; Render an Ltypescript Statement as JSON.
@@ -397,7 +412,7 @@
              (cons "value" (datum->json datum)))]
       [(var-ref ,src ,var-name)
        (list (cons "expr" "var")
-             (cons "name" (sym->json (id-sym var-name))))]
+             (cons "name" (var-id->json var-name)))]
       [(default ,src ,type)
        (list (cons "expr" "default")
              (cons "type" (type->json type)))]
@@ -492,7 +507,7 @@
              (cons "value" (expression->json expr)))]
       [(= ,src ,var-name ,expr)
        (list (cons "expr" "assign")
-             (cons "name" (sym->json (id-sym var-name)))
+             (cons "name" (var-id->json var-name))
              (cons "value" (expression->json expr)))]
       [(call ,src ,function-name ,expr* ...)
        ;; Emit `function-uniq` (id-uniq) so consumers can disambiguate
@@ -622,7 +637,7 @@
                     (map (lambda (a)
                            (nanopass-case (Ltypescript Argument) a
                              [(,var-name ,type)
-                              (list (cons "name" (sym->json (id-sym var-name)))
+                              (list (cons "name" (var-id->json var-name))
                                     (cons "type" (type->json type)))]))
                          arg*)))
              (cons "result-type" (type->json type))
@@ -758,7 +773,7 @@
       (define (Argument arg)
         (nanopass-case (Ltypescript Argument) arg
           [(,var-name ,type)
-           (list (cons "name" (sym->json (id-sym var-name)))
+           (list (cons "name" (var-id->json var-name))
                  (cons "type" (type->json type)))]))
 
       ;; Walk the public-ledger-array tree and flatten to bindings.
