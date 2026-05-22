@@ -161,6 +161,9 @@
                          elt-name* pure-dcl* type** type*))))]
       [(tadt ,src ,adt-name ([,adt-formal* ,adt-arg*] ...) ,vm-expr (,adt-op* ...) (,adt-rt-op* ...))
        (adt-type->json (clean-adt-name adt-name) adt-arg*)]
+      [(tunknown)
+       ;; element type of an empty vector literal; never instantiated
+       '(("type-name" . "Unknown"))]
       [else
        (internal-errorf 'runtime-ir
          "unhandled Type variant in runtime-ir emission: ~s"
