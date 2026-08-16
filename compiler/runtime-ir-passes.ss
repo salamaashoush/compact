@@ -52,7 +52,10 @@
           (typescript-passes)
           (pass-helpers))
 
-  (define schema-version 1)
+  ;; 2: compactc 0.33 — curve-typed fields and points, arithmetic binops
+  ;; carrying an operand type instead of a bit width, the cast-to-field /
+  ;; cast-from-field / emit expressions, and the `contracts` section.
+  (define schema-version 2)
 
   ;; A ref-expression carrier: when expand-vm-code substitutes an arg
   ;; (e.g. circuit-call argument or runtime-computed path element), we
@@ -1092,6 +1095,13 @@
                (cons "runtime-version" runtime-version-string)
                ;; Metadata sections (mirror contract-info.json so consumers
                ;; need only this file).
+               ;; Declared subcontract types, the `contracts` section of
+               ;; contract-info.json.  A contract passed only as a circuit
+               ;; argument never reaches a ledger field, so this is the
+               ;; sole record of its circuit signatures.  Emitted in the
+               ;; tagged form every other type in this file uses.
+               (cons "contracts"
+                     (list->vector (map type->json contract-type*)))
                (cons "ledger"
                      (list->vector (fold-right
                                      (lambda (p acc) (append (LedgerField p) acc))
