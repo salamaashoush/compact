@@ -101,6 +101,23 @@
           (string->symbol (substring s 10 (string-length s)))
           adt-name)))
 
+  ;; Curve-typed field and point names, spelled exactly as
+  ;; extract-contract-info.ss and print-typescript.ss spell them so a
+  ;; consumer can join runtime-ir against contract-info by type name.
+  ;; `(field-base (curve-jubjub))` is absent from both upstream emitters:
+  ;; jubjub's base field is the native field.
+  (define (field-type-name ftype)
+    (nanopass-case (Ltypescript Field-Type) ftype
+      [(field-native) "Field"]
+      [(field-scalar (curve-jubjub)) "JubjubScalar"]
+      [(field-base (curve-secp256k1)) "Secp256k1Base"]
+      [(field-scalar (curve-secp256k1)) "Secp256k1Scalar"]))
+
+  (define (point-type-name ctype)
+    (nanopass-case (Ltypescript Curve-Type) ctype
+      [(curve-jubjub) "JubjubPoint"]
+      [(curve-secp256k1) "Secp256k1Point"]))
+
   ;; A non-emit pass that renders an Ltypescript Type as JSON.  We do
   ;; this with a `nanopass-case` walker rather than a define-pass since
   ;; the output is a Scheme datum, not an IR.
@@ -108,11 +125,13 @@
     (nanopass-case (Ltypescript Type) type
       [(tboolean ,src)
        '(("type-name" . "Boolean"))]
-      [(tfield ,src)
-       '(("type-name" . "Field"))]
+      [(tfield ,src ,ftype)
+       (list (cons "type-name" (field-type-name ftype)))]
       [(tunsigned ,src ,nat)
        (list (cons "type-name" "Uint")
              (cons "maxval" (number->json nat)))]
+      [(tpoint ,src ,ctype)
+       (list (cons "type-name" (point-type-name ctype)))]
       [(tbytes ,src ,len)
        (list (cons "type-name" "Bytes")
              (cons "length" len))]
@@ -473,12 +492,12 @@
              (cons "start" (expression->json index))
              (cons "length" len)
              (cons "result-type" (type->json type)))]
-      [(+ ,src ,mbits ,expr1 ,expr2)
-       (binop->json "+" mbits expr1 expr2)]
-      [(- ,src ,mbits ,expr1 ,expr2)
-       (binop->json "-" mbits expr1 expr2)]
-      [(* ,src ,mbits ,expr1 ,expr2)
-       (binop->json "*" mbits expr1 expr2)]
+      [(+ ,src ,type ,expr1 ,expr2)
+       (arith-binop->json "+" type expr1 expr2)]
+      [(- ,src ,type ,expr1 ,expr2)
+       (arith-binop->json "-" type expr1 expr2)]
+      [(* ,src ,type ,expr1 ,expr2)
+       (arith-binop->json "*" type expr1 expr2)]
       [(< ,src ,bits ,expr1 ,expr2)
        (binop->json "<" bits expr1 expr2)]
       [(<= ,src ,bits ,expr1 ,expr2)
@@ -533,9 +552,20 @@
                    (list->vector
                     (append (map expression->json expr*)
                             (list (expression->json expr))))))]
-      [(field->bytes ,src ,len ,expr)
+      [(field->bytes ,src ,len ,ftype ,expr)
        (list (cons "expr" "field->bytes")
              (cons "length" len)
+             (cons "field-type" (field-type-name ftype))
+             (cons "value" (expression->json expr)))]
+      [(cast-to-field ,src ,ftype ,type ,expr)
+       (list (cons "expr" "cast-to-field")
+             (cons "field-type" (field-type-name ftype))
+             (cons "from" (type->json type))
+             (cons "value" (expression->json expr)))]
+      [(cast-from-field ,src ,nat ,ftype ,expr)
+       (list (cons "expr" "cast-from-field")
+             (cons "maxval" (number->json nat))
+             (cons "field-type" (field-type-name ftype))
              (cons "value" (expression->json expr)))]
       [(cast-from-bytes ,src ,type ,len ,expr)
        (list (cons "expr" "cast-from-bytes")
@@ -593,6 +623,25 @@
                     (map map-arg->json (cons map-arg map-arg*)))))]
       [(public-ledger ,src ,ledger-field-name ,sugar (,path-elt* ...) ,src^ ,adt-op ,expr* ...)
        (adt-op-invocation->json ledger-field-name path-elt* adt-op expr*)]
+      ;; Contract event emission.  `expr` is already the serialized
+      ;; payload; `len` is its byte length.  The vm-code binds the same
+      ;; three names print-typescript.ss binds, so consumers replaying
+      ;; the ops see an identical `queryLedgerState` sequence.
+      [(emit ,src ,event-version ,event-tag ,len ,expr ,vm-code)
+       (let* ([bytes-type (with-output-language (Ltypescript Type) `(tbytes ,src ,len))]
+              [vminstr* (expand-vm-code src #f #f
+                          (list (cons 'emit-version event-version)
+                                (cons 'emit-tag event-tag)
+                                (cons 'emit-payload
+                                      (make-vmref-expr bytes-type
+                                                       (expression->json expr))))
+                          (vm-code-code vm-code))])
+         (list (cons "expr" "emit")
+               (cons "event-version" (number->json event-version))
+               (cons "event-tag" (number->json event-tag))
+               (cons "payload-length" len)
+               (cons "payload" (expression->json expr))
+               (cons "vm-ops" (vminstrs->json-vector vminstr*))))]
       [(contract-call ,src ,elt-name (,expr ,type) ,expr* ...)
        (list (cons "expr" "contract-call")
              (cons "circuit" (sym->json elt-name))
@@ -609,6 +658,17 @@
     (list (cons "expr" "binop")
           (cons "op" op-str)
           (cons "bits" (if bits (number->json bits) (void)))
+          (cons "left" (expression->json expr1))
+          (cons "right" (expression->json expr2))))
+
+  ;; `+`, `-` and `*` carry their full operand type rather than a bit
+  ;; width: the type selects the arithmetic implementation, since a
+  ;; curve field wraps at its own modulus (print-typescript.ss picks
+  ;; `addField` / `secp256k1BaseAdd` / `secp256k1ScalarAdd` off it).
+  (define (arith-binop->json op-str type expr1 expr2)
+    (list (cons "expr" "binop")
+          (cons "op" op-str)
+          (cons "type" (type->json type))
           (cons "left" (expression->json expr1))
           (cons "right" (expression->json expr2))))
 
@@ -1021,7 +1081,7 @@
                   pl-array-elt*))])))
 
     (Program : Program (ir) -> Program ()
-      [(program ,src ((,export-name* ,name*) ...) ,tdescs ,pelt* ...)
+      [(program ,src (,contract-type* ...) ((,export-name* ,name*) ...) ,tdescs ,pelt* ...)
        (let ([op (get-target-port 'runtime-ir.cbor)])
          (let ([export-alist (map cons export-name* name*)])
            (print-cbor op
